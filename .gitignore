@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+review/
+narratives/
+signals/
+*_cache.json
+dq_state.json
+CLOSE_REVIEW_*.md
+DELIVERY_REVIEW_*.md
+project_review.md
