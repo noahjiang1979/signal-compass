@@ -1188,6 +1188,63 @@ def calc_accuracy(rev, dates, forward_days=1):
     "paired":len(dates)-forward_days  # 有效配对天数
   }
 
+def _calc_signal_accuracy(rev, dates):
+  """v2.3: 子信号级别自验证 — T日触发信号 → T+1实际涨跌
+  所有A股信号均为空头性质(加分=偏空), 验证逻辑: T+1跌=命中
+  返回: {tag: {total, hit, rate, avg_score_impact}}
+  """
+  sig_stats={}  # {tag: {"total":N, "hit":N, "impact_sum":X}}
+  for i in range(len(dates)-1):
+    td=dates[i]; nd=dates[i+1]
+    tkey=rev[td].get("key",{}); nkey=rev[nd].get("key",{})
+    tss=tkey.get("ss"); nss=nkey.get("ss")
+    if tss is None or nss is None: continue
+    is_down=nss<tss  # T+1收跌
+    triggers=rev[td].get("triggers",[])
+    if not triggers: continue
+    for tag in triggers:
+      st=sig_stats.setdefault(tag,{"total":0,"hit":0,"impact_sum":0})
+      st["total"]+=1
+      if is_down: st["hit"]+=1
+  # 计算命中率
+  result={}
+  for tag,st in sig_stats.items():
+    if st["total"]>=2:
+      st["rate"]=round(st["hit"]/st["total"],2)
+    else:
+      st["rate"]=None
+    result[tag]=st
+  # 写入 rules.json 做重量参考
+  _save_signal_weights(result)
+  return result
+
+def _save_signal_weights(sig_stats):
+  """将信号命中率写入 rules.json，供后续自动调整权重"""
+  import json,os as _os
+  fp=_os.path.join(_app_dir(),"rules.json")
+  rules={}
+  if _os.path.exists(fp):
+    try:
+      with open(fp,"r",encoding="utf-8") as f: rules=json.load(f)
+    except: pass
+  now_ts=datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+  for tag,st in sig_stats.items():
+    if st.get("rate") is not None and st["total"]>=3:
+      # 命中率≥67%保持权重, 50-67%降至0.75x, <50%降至0.5x, <33%降至0.25x
+      rate=st["rate"]
+      if rate>=0.67: w=1.0
+      elif rate>=0.50: w=0.75
+      elif rate>=0.33: w=0.50
+      else: w=0.25
+      rules[tag]={
+        "weight":w,"hit_rate":rate,
+        "samples":st["total"],
+        "updated":now_ts
+      }
+  if rules:
+    with open(fp,"w",encoding="utf-8") as f:
+      json.dump(rules,f,indent=2,ensure_ascii=False)
+
 def run_review():
   import datetime as dt,json,os
   hdr("Hermes Signal Compass - Review Mode - "+now())
@@ -1314,9 +1371,49 @@ def run_review():
           print("    {}: {}涨 {}跌".format(lv,bl[lv]["up"],bl[lv]["dn"]))
   else:
     print("\n  信号准确率: 无有效样本(T日→T+1日配对需要至少2天数据)")
+  # --- v2.3: 子信号命中率 ---
+  sig_ac=_calc_signal_accuracy(rev,dates)
+  if sig_ac:
+    print("\n  【子信号命中率】(T日触发→T+1收跌=命中, ≥3样本)")
+    items=sorted(sig_ac.items(),key=lambda x:x[1].get("total",0),reverse=True)
+    for tag,st in items[:12]:
+      rate_str="{:.0%}".format(st["rate"]) if st.get("rate") is not None else "--"
+      mark=G if st.get("rate") and st["rate"]>=0.67 else Y if st.get("rate") and st["rate"]>=0.5 else R if st.get("rate") is not None else ""
+      print("    {} {} {}/{} 命中{}".format(mark,tag,st["hit"],st["total"],rate_str))
+    # 自动降权提示
+    fp=os.path.join(_app_dir(),"rules.json")
+    if os.path.exists(fp):
+      try:
+        with open(fp,"r",encoding="utf-8") as f: rules=json.load(f)
+        low=[k for k,v in rules.items() if v.get("weight",1)<1.0]
+        if low:
+          print("    ⚡ 自动降权: "+", ".join("{}→{}x".format(k,rules[k]["weight"]) for k in low[:5]))
+      except: pass
   print("\n  "+"\u2550"*50)
   print("  标记方式: 在笔记中写 [涨]/[跌]/[平]")
   print("  "+"\u2550"*50)
+  # --- Phase 进展提示 ---
+  fp=os.path.join(_app_dir(),"rules.json")
+  phase_ready=False
+  if os.path.exists(fp):
+    try:
+      with open(fp,"r",encoding="utf-8") as f: rules=json.load(f)
+      if rules: phase_ready=True
+    except: pass
+  if phase_ready:
+    print("\n  ⚡ Phase 1B 就绪 — 信号已积累足够样本，可以开始错误模式库开发")
+    print("     对 Hermes 说: 开始 Phase 1B")
+  else:
+    # 统计还需多少样本
+    sig_ac=_calc_signal_accuracy(rev,dates) if 'rev' in dir() and 'dates' in dir() else {}
+    closest=None;closest_n=0
+    for tag,st in sig_ac.items():
+      if st.get("total",0)>closest_n and st.get("total",0)<3:
+        closest=tag;closest_n=st["total"]
+    if closest:
+      print("\n  📋 Phase 1B 就绪条件: 任一信号≥3样本 (最近: {} {}/3)".format(closest,closest_n))
+    else:
+      print("\n  📋 Phase 1B 就绪条件: 任一信号≥3样本 (当前最高: 0/3)")
 # --- 三指标组合信号（分层过滤版） ---
 def get_signal(kd):
   """分层过滤：MA定趋势→BIAS控风险→MACD/KDJ/量能精调

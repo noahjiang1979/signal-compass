@@ -106,6 +106,22 @@ count_anomaly_ann() → 异动公告计数 → 提示区
 - P1: 信号/强度矛盾消歧: rel>3时标注"⚠️矛盾"替代"拉高出货" (line 1757)
 - P2: 清理20260520 review脏数据: ud_ratio=99→null
 
+## 最新改动（2026-05-23 — v2.3 Phase 1A 信号自验证）
+- **子信号命中率统计**: `_calc_signal_accuracy()` — T日触发信号 → T+1实际涨跌验证
+  - 基于 review 存档的 `key.ss` 比对，零 AI 依赖
+  - ≥3 样本才计算命中率；≥67%🟢 / 50-67%🟡 / <50%🔴
+  - 自动写入 `rules.json`（weight/hit_rate/samples/updated）
+- **自动降权**: `_save_signal_weights()` — 命中率<67%的信号自动降权至 0.75x/0.5x/0.25x
+- **review 输出新增**:【子信号命中率】段落，含颜色标记和自动降权提示
+- **compass.bat 修复**: 去掉旧版 4 选项 choice 菜单，统一由 Python main_menu() 接管（含选项5编辑自选池）
+- **语法验证**: py_compile.compile 通过
+- **新增文件**: rules.json（自动生成，存信号权重）
+
+## Phase 1 状态
+- ✅ Phase 1A: 信号自验证引擎 — 已完成
+- [ ] Phase 1B: 错误模式库 — 待实现
+- [ ] Phase 1C: rules.json 加载（评分时读取权重）— 待实现
+
 ## 待办/已知问题
 - [ ] 涨跌家数API（东财push2）偶尔502 → 回退方案未实现
 - [ ] 组合池提示中利通电子出现3次（主行+注+事件），可以考虑缩并
