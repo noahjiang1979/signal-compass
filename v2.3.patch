@@ -1,0 +1,202 @@
+=== Signal Compass v2.3 补丁 ===
+日期: 2026-05-24
+三方: Hermes + qclaw + WorkBuddy
+内容: 地基修复(35→250) + KDJ13双确认 + BOLL + cap标签
+
+=== 改动 1: Feature Flags（新增，插入在 get_signal() 之前）===
+位置: compass.py, 在 Phase 1B 打印段之后、get_signal() 之前
+
+  # === v2.3 Feature Flags ===
+  _F_K13=True   # Step 2: KDJ13双确认
+  _F_BOLL=True  # Step 3: BOLL+带宽收窄
+  _F_CAP=True   # Step 4: cap标签
+
+=== 改动 2: _boll_calc() 函数（新增，插入在 Feature Flags 之后）===
+
+  def _boll_calc(c, n=20):
+    """布林带计算: 返回 (mid, upper, lower, bw, std)
+       bw = (upper-lower)/mid, 用于收窄检测"""
+    if len(c) < n: return None, None, None, None, None
+    mid = sum(c[-n:]) / n
+    std = (sum((x - mid)**2 for x in c[-n:]) / n) ** 0.5
+    upper = mid + 2 * std
+    lower = mid - 2 * std
+    bw = (upper - lower) / mid if mid > 0 else None
+    return mid, upper, lower, bw, std
+
+=== 改动 3: get_signal() 重写 ===
+替换整个 get_signal() 函数体。关键改动:
+  a) 在 extreme 计算后插入 BOLL 计算 + cap 标签（~25行）
+  b) 震荡分支 KDJ(9) → KDJ(9)+KDJ(13) 双确认（~8行）
+  c) 所有 return 改为 rem/rtxt/rsc 结果变量，末尾统一追加标签（~15行）
+  d) 返回值不变: (emoji, text, score)，text 内含标签后缀
+
+具体代码见下方完整 get_signal() 函数。请注意:
+  - 原有 import statistics、ma()、kdj_n()、ema() 等不变
+  - MACD/BIAS/extreme/anomaly_3d 计算逻辑不变
+  - 所有分支的判定逻辑不变（仅返回方式从直接 return 改为设结果变量）
+
+=== 完整 get_signal() ===
+
+def get_signal(kd):
+  """分层过滤：MA定趋势→BIAS控风险→MACD/KDJ/量能精调
+     返回 (emoji, 短评, 得分)  分层决定，非平铺加减"""
+  import statistics
+  c=kd.get("c",[]);h=kd.get("h",[]);l=kd.get("l",[]);v=kd.get("v",[])
+  if not c or len(c)<26:return W,"数据不足",0
+  p=c[-1]
+  # --- 均线 ---
+  def ma(n):return sum(c[-n:])/n if len(c)>=n else None
+  ma5=ma(5);ma10=ma(10);ma20=ma(20);ma60=ma(60)
+  # --- KDJ双参数 ---
+  def kdj_n(n):
+    if len(c)<n+2:return 50,50,50
+    k=d=50
+    for i in range(-n,0):
+      hi=max(h[:i]) if i<0 else max(h[-n:]);lo=min(l[:i]) if i<0 else min(l[-n:])
+      if hi==lo:r=50
+      else:r=100*(c[i]-lo)/(hi-lo)
+      k=2/3*k+1/3*r;d=2/3*d+1/3*k
+    return k,d,3*k-2*d
+  k9,d9,j9=kdj_n(9);k13,d13,j13=kdj_n(13)
+  # --- MACD ---
+  def ema(pv,n):
+    if len(pv)<n:return None
+    k=2/(n+1);v=pv[-n]
+    for i in range(-n+1,0):v=pv[i]*k+v*(1-k)
+    return v
+  e12=ema(c,12);e26=ema(c,26)
+  if e12 is None or e26 is None:return W,"数据不足",0
+  dif=e12-e26;dea=0
+  difs=[]
+  for end in range(26,len(c)+1):
+    e12i=ema(c[:end],12);e26i=ema(c[:end],26)
+    if e12i is not None and e26i is not None:difs.append(e12i-e26i)
+  if difs:dea=difs[-1] if len(difs)==1 else (ema(difs,9) if len(difs)>=9 else difs[-1])
+  # --- 成交量+x市值分仓 ---
+  avg5v=sum(v[-5:])/5 if len(v)>=5 else 1
+  vr=v[-1]/avg5v if avg5v>0 else 1
+  avg_p=sum(c[-20:])/20;avg_v=sum(v[-20:])/20 if len(v)>=20 else avg5v
+  est_turnover=avg_p*avg_v
+  cap="大" if est_turnover>5e9 else ("小" if est_turnover<1e9 else "中")
+  # --- BIAS(6) ---
+  ma6=ma(6);bias6=(p-ma6)/ma6*100 if ma6 and ma6>0 else 99
+  # --- 严重异动（两级检测） ---
+  anomaly_3d=False
+  if len(c)>=6:
+    d1=(c[-3]-c[-4])/c[-4]*100 if c[-4]!=0 else 0
+    d2=(c[-2]-c[-3])/c[-3]*100 if c[-3]!=0 else 0
+    d3=(c[-1]-c[-2])/c[-2]*100 if c[-2]!=0 else 0
+    anomaly_3d=(d1+d2+d3)>=20
+  high10=max(c[-10:]) if len(c)>=10 else p
+  rise10=(high10-c[-10])/c[-10]*100 if len(c)>=10 and c[-10]>0 else 0
+  high30=max(c[-30:]) if len(c)>=30 else p
+  rise30=(high30-c[-30])/c[-30]*100 if len(c)>=30 and c[-30]>0 else 0
+  extreme=rise10>=100 or rise30>=200
+  # --- BOLL计算 + 收窄检测 ---
+  boll_label="";boll_narrow=False
+  if _F_BOLL and len(c)>=20:
+    bmid,bupper,blower,bbw,bstd=_boll_calc(c,20)
+    if bmid is not None:
+      if p>=bupper:boll_label="[上轨]"
+      elif p>=bmid:boll_label="[中轨上方]"
+      elif p>=blower:boll_label="[中轨下方]"
+      else:boll_label="[下轨]"
+      if bbw is not None and len(c)>=40:
+        bws=[]
+        for i in range(19,len(c)):
+          mi=sum(c[i-19:i+1])/20
+          si=(sum((x-mi)**2 for x in c[i-19:i+1])/20)**0.5
+          if mi>0:bws.append(4*si/mi)
+        if bws:
+          pct=sum(1 for b in bws if b<bbw)/len(bws)
+          boll_narrow=pct<0.20
+  cap_label=f"[{cap}盘]" if _F_CAP else ""
+
+  # === Layer 1: MA趋势 ===
+  if all(x is not None for x in [ma5,ma10,ma20,ma60]):
+    if ma5>ma10>ma20>ma60:trend="强多头";b=3
+    elif ma5<ma10<ma20<ma60:trend="强空头";b=-3
+    elif ma5>ma20 and ma10>ma20:trend="偏多";b=2
+    elif ma5<ma20 and ma10<ma20:trend="偏空";b=-2
+    else:trend="震荡";b=0
+  else:trend="震荡";b=0
+
+  # === 按趋势分支决策（层2+3合一）===
+  rem,rtxt,rsc=None,None,None
+  if trend=="强多头":
+    if extreme:rem,rtxt,rsc=R,"异动预警",-2
+    elif anomaly_3d:rem,rtxt,rsc=Y,"涨幅偏离",-1
+    elif bias6>15:rem,rtxt,rsc=Y,"多头过热",1
+    elif bias6>10:rem,rtxt,rsc=Y,"多头超买",2
+    elif bias6<-8:rem,rtxt,rsc=Y,"急跌回调",0
+    elif dif>dea and vr>1.3 and j9<90:rem,rtxt,rsc=G,"放量上攻",3
+    elif dif>dea:rem,rtxt,rsc=Y,"多头",2
+    elif dif<dea:rem,rtxt,rsc=Y,"多头微调",1
+    else:rem,rtxt,rsc=Y,"多头",2
+  elif trend=="偏多":
+    if extreme:rem,rtxt,rsc=R,"异动预警",-2
+    elif anomaly_3d:rem,rtxt,rsc=Y,"涨幅偏离",-1
+    elif bias6>15:rem,rtxt,rsc=Y,"超买过热",1
+    elif dif>dea and vr>1.3:rem,rtxt,rsc=G,"放量突破",3
+    elif dif>dea:rem,rtxt,rsc=Y,"偏多",2
+    else:rem,rtxt,rsc=Y,"偏多偏弱",1
+  elif trend=="强空头":
+    if bias6<-15 and dif>dea:rem,rtxt,rsc=Y,"超跌反弹",1
+    else:rem,rtxt,rsc=R,"空头回避",-3
+  elif trend=="偏空":
+    if bias6<-15:rem,rtxt,rsc=Y,"超跌观察",0
+    else:rem,rtxt,rsc=R,"偏空",-2
+  else:
+    if extreme:rem,rtxt,rsc=R,"严重异动",-2
+    elif anomaly_3d:rem,rtxt,rsc=Y,"涨幅偏离",-1
+    elif dif>dea and vr>1.3 and j9<80:rem,rtxt,rsc=Y,"放量突破",1
+    elif bias6<-15 and dif>dea:rem,rtxt,rsc=Y,"超跌反弹",1
+    elif bias6>15 and dif<dea:rem,rtxt,rsc=R,"过热死叉",-1
+    elif bias6<-8:rem,rtxt,rsc=R,"急跌",-1
+    else:
+      if _F_K13:
+        kdj9_up=j9>k9>d9;kdj9_down=j9<k9<d9
+        kdj13_up=j13>k13>d13;kdj13_down=j13<k13<d13
+        if kdj9_down and kdj13_down:rem,rtxt,rsc=R,"震荡偏空",-1
+        elif kdj9_up and kdj13_up:rem,rtxt,rsc=Y,"震荡偏多",1
+      else:
+        if j9>k9>d9:rem,rtxt,rsc=Y,"震荡偏多",1
+        elif j9<k9<d9:rem,rtxt,rsc=R,"震荡偏空",-1
+      if rem is None:
+        if dif>dea:rem,rtxt,rsc=Y,"动能偏强",0
+        elif dif<dea:rem,rtxt,rsc=R,"动能偏弱",0
+        else:rem,rtxt,rsc=W,"中性",0
+
+  # === 标签追加（v2.3） ===
+  labels=[]
+  if _F_BOLL and boll_narrow:
+    tag=False
+    if rtxt=="强多头":rtxt="多头";rsc=2;tag=True
+    elif rtxt in ("多头","偏多"):rtxt="偏多偏弱";rsc=1;tag=True
+    elif rtxt=="偏空":tag=True
+    if tag:labels.append("[收窄]")
+  if boll_label:labels.append(boll_label)
+  if cap_label:labels.append(cap_label)
+  if labels:rtxt=f"{rtxt} {' '.join(labels)}"
+  return rem,rtxt,rsc
+
+=== 改动 4: 个股 K线窗口 35→250 ===
+位置: run_portfolio() 中 sina_k 调用处
+
+  原: kd=sina_k(code,35)
+  改: kd=sina_k(code,250)
+
+=== 验证记录 ===
+已在本机（coolt Windows 11）逐 Step 验证，全部通过:
+  Step 1 (250天): 2只个股信号反转（协创🔴→🟡, 鼎龙🔴→🟡），趋势判定激活
+  Step 2 (KDJ13): 协创 KDJ9/13不一致→落MACD动能偏弱，去噪成功
+  Step 3 (BOLL): 9只全部正确显示位置标签，无触发带宽收窄
+  Step 4 (cap): 大盘4/中盘3/小盘2，标签正确
+
+=== Feature Flags ===
+可分步启用/回退:
+  _F_K13=True   # KDJ13双确认
+  _F_BOLL=True  # BOLL+带宽收窄
+  _F_CAP=True   # cap标签
+  设 False 可单独关闭对应功能

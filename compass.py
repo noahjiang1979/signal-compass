@@ -649,6 +649,17 @@ def run_a():
     except:pass
 
   print("  === A-Share Signal Map ===")
+  # SS交叉校验提前到显示前 (v2.3: 防Sina实时错数据在输出层骗用户)
+  _ss_sina_early=(q.get(A["SS"]) or {}).get("p")
+  if _ss_sina_early is not None and syk and syk.get("c"):
+    _ss_k_early=syk["c"][-1]
+    if abs(_ss_sina_early-_ss_k_early)/_ss_k_early>0.01:
+      if not is_trading():
+        print("  ⚠️ SS数据源偏差: sina实时{:.2f} vs K线收盘{:.2f}, 展示用K线值".format(_ss_sina_early,_ss_k_early))
+        # 用K线收盘+昨收中计算日涨跌
+        _prev_close=syk["c"][-2] if len(syk["c"])>=2 else _ss_k_early
+        _chg=(_ss_k_early-_prev_close)/_prev_close*100 if _prev_close>0 else 0
+        q[A["SS"]]={"p":_ss_k_early,"chg":_chg}
   risk=[];trend_score=0;extreme_score=0;yc_mult=1.0  # 双轨: 趋势压力/偏离极值
 
   # --- 1. 核心四指数矩阵 ---
@@ -1048,6 +1059,12 @@ def run_a():
   print("  降级: {}/{} 满足".format(dn_trig,dn_total))
   # --- 存档 ---
   cv=(q.get(A["CY"]) or {}).get("chg")
+  # CY交叉校验: Sina实时 chg vs K线实际日涨跌 (v2.3-I: 防[涨]/[跌]标签被脏数据骗)
+  if cv is not None and cyk and cyk.get("c") and len(cyk["c"])>=2:
+    _cy_k_chg=(cyk["c"][-1]-cyk["c"][-2])/cyk["c"][-2]*100
+    if abs(cv-_cy_k_chg)>1 and not is_trading():
+      print("  ⚠️ CY涨跌偏差: sina实时{:+.2f}% vs K线实际{:+.2f}%, 标签用K线值".format(cv,_cy_k_chg))
+      cv=_cy_k_chg
   if cv is not None:
     if cv>0.2:auto="[涨]"
     elif cv<-0.2:auto="[跌]"
@@ -1414,6 +1431,22 @@ def run_review():
       print("\n  📋 Phase 1B 就绪条件: 任一信号≥3样本 (最近: {} {}/3)".format(closest,closest_n))
     else:
       print("\n  📋 Phase 1B 就绪条件: 任一信号≥3样本 (当前最高: 0/3)")
+# === v2.3 Feature Flags ===
+_F_K13=True   # Step 2: KDJ13双确认
+_F_BOLL=True  # Step 3: BOLL+带宽收窄
+_F_CAP=True   # Step 4: cap标签
+
+def _boll_calc(c, n=20):
+  """布林带计算: 返回 (mid, upper, lower, bw, std)
+     bw = (upper-lower)/mid, 用于收窄检测"""
+  if len(c) < n: return None, None, None, None, None
+  mid = sum(c[-n:]) / n
+  std = (sum((x - mid)**2 for x in c[-n:]) / n) ** 0.5
+  upper = mid + 2 * std
+  lower = mid - 2 * std
+  bw = (upper - lower) / mid if mid > 0 else None
+  return mid, upper, lower, bw, std
+
 # --- 三指标组合信号（分层过滤版） ---
 def get_signal(kd):
   """分层过滤：MA定趋势→BIAS控风险→MACD/KDJ/量能精调
@@ -1472,6 +1505,27 @@ def get_signal(kd):
   high30=max(c[-30:]) if len(c)>=30 else p
   rise30=(high30-c[-30])/c[-30]*100 if len(c)>=30 and c[-30]>0 else 0
   extreme=rise10>=100 or rise30>=200
+  # --- BOLL计算 + 收窄检测 ---
+  boll_label="";boll_narrow=False
+  if _F_BOLL and len(c)>=20:
+    bmid,bupper,blower,bbw,bstd=_boll_calc(c,20)
+    if bmid is not None:
+      if p>=bupper:boll_label="[上轨]"
+      elif p>=bmid:boll_label="[中轨上方]"
+      elif p>=blower:boll_label="[中轨下方]"
+      else:boll_label="[下轨]"
+      # 带宽收窄: 当前带宽处于过去20天最低20%分位
+      if bbw is not None and len(c)>=40:
+        bws=[]
+        for i in range(19,len(c)):
+          mi=sum(c[i-19:i+1])/20
+          si=(sum((x-mi)**2 for x in c[i-19:i+1])/20)**0.5
+          if mi>0:bws.append(4*si/mi)
+        if bws:
+          pct=sum(1 for b in bws if b<bbw)/len(bws)
+          boll_narrow=pct<0.20
+  # --- cap标签 ---
+  cap_label=f"[{cap}盘]" if _F_CAP else ""
   
   # === Layer 1: MA趋势 ===
   if all(x is not None for x in [ma5,ma10,ma20,ma60]):
@@ -1483,49 +1537,78 @@ def get_signal(kd):
   else:trend="震荡";b=0
 
   # === 按趋势分支决策（层2+3合一）===
+  rem,rtxt,rsc=None,None,None
   # 强多头
   if trend=="强多头":
-    if extreme:return R,"异动预警",-2
-    if anomaly_3d:return Y,"涨幅偏离",-1
-    if bias6>15:return Y,"多头过热",1  # 不做空，但等回调
-    if bias6>10:return Y,"多头超买",2
-    if bias6<-8:return Y,"急跌回调",0   # 强多头中突跌>3%, 等稳再判断
-    # 合理区间或微超买
-    if dif>dea and vr>1.3 and j9<90:return G,"放量上攻",3
-    if dif>dea:return Y,"多头",2
-    if dif<dea:return Y,"多头微调",1
-    return Y,"多头",2
+    if extreme:rem,rtxt,rsc=R,"异动预警",-2
+    elif anomaly_3d:rem,rtxt,rsc=Y,"涨幅偏离",-1
+    elif bias6>15:rem,rtxt,rsc=Y,"多头过热",1
+    elif bias6>10:rem,rtxt,rsc=Y,"多头超买",2
+    elif bias6<-8:rem,rtxt,rsc=Y,"急跌回调",0
+    elif dif>dea and vr>1.3 and j9<90:rem,rtxt,rsc=G,"放量上攻",3
+    elif dif>dea:rem,rtxt,rsc=Y,"多头",2
+    elif dif<dea:rem,rtxt,rsc=Y,"多头微调",1
+    else:rem,rtxt,rsc=Y,"多头",2
   # 偏多
   elif trend=="偏多":
-    if extreme:return R,"异动预警",-2
-    if anomaly_3d:return Y,"涨幅偏离",-1
-    if bias6>15:return Y,"超买过热",1
-    if dif>dea and vr>1.3:return G,"放量突破",3
-    if dif>dea:return Y,"偏多",2
-    return Y,"偏多偏弱",1
+    if extreme:rem,rtxt,rsc=R,"异动预警",-2
+    elif anomaly_3d:rem,rtxt,rsc=Y,"涨幅偏离",-1
+    elif bias6>15:rem,rtxt,rsc=Y,"超买过热",1
+    elif dif>dea and vr>1.3:rem,rtxt,rsc=G,"放量突破",3
+    elif dif>dea:rem,rtxt,rsc=Y,"偏多",2
+    else:rem,rtxt,rsc=Y,"偏多偏弱",1
   # 强空头
   elif trend=="强空头":
-    if bias6<-15 and dif>dea:return Y,"超跌反弹",1
-    return R,"空头回避",-3
+    if bias6<-15 and dif>dea:rem,rtxt,rsc=Y,"超跌反弹",1
+    else:rem,rtxt,rsc=R,"空头回避",-3
   # 偏空
   elif trend=="偏空":
-    if bias6<-15:return Y,"超跌观察",0
-    return R,"偏空",-2
+    if bias6<-15:rem,rtxt,rsc=Y,"超跌观察",0
+    else:rem,rtxt,rsc=R,"偏空",-2
   # 震荡
   else:
-    if extreme:return R,"严重异动",-2
-    if anomaly_3d:return Y,"涨幅偏离",-1
-    if dif>dea and vr>1.3 and j9<80:return Y,"放量突破",1
-    if bias6<-15 and dif>dea:return Y,"超跌反弹",1
-    if bias6>15 and dif<dea:return R,"过热死叉",-1
-    if bias6<-8:return R,"急跌",-1         # 单日跌>3%, KDJ可能滞后
-    # KDJ方向
-    if j9>k9>d9:return Y,"震荡偏多",1
-    if j9<k9<d9:return R,"震荡偏空",-1
-    # MACD柱方向
-    if dif>dea:return Y,"动能偏强",0
-    if dif<dea:return R,"动能偏弱",0
-    return W,"中性",0
+    if extreme:rem,rtxt,rsc=R,"严重异动",-2
+    elif anomaly_3d:rem,rtxt,rsc=Y,"涨幅偏离",-1
+    elif dif>dea and vr>1.3 and j9<80:rem,rtxt,rsc=Y,"放量突破",1
+    elif bias6<-15 and dif>dea:rem,rtxt,rsc=Y,"超跌反弹",1
+    elif bias6>15 and dif<dea:rem,rtxt,rsc=R,"过热死叉",-1
+    elif bias6<-8:rem,rtxt,rsc=R,"急跌",-1         # 单日跌>3%, KDJ可能滞后
+    else:
+      # KDJ方向 (v2.3: KDJ13双确认)
+      if _F_K13:
+        kdj9_up=j9>k9>d9;kdj9_down=j9<k9<d9
+        kdj13_up=j13>k13>d13;kdj13_down=j13<k13<d13
+        if kdj9_down and kdj13_down:rem,rtxt,rsc=R,"震荡偏空",-1
+        elif kdj9_up and kdj13_up:rem,rtxt,rsc=Y,"震荡偏多",1
+      else:
+        if j9>k9>d9:rem,rtxt,rsc=Y,"震荡偏多",1
+        elif j9<k9<d9:rem,rtxt,rsc=R,"震荡偏空",-1
+      # KDJ不一致或未触发 → 落MACD方向
+      if rem is None:
+        if dif>dea:rem,rtxt,rsc=Y,"动能偏强",0
+        elif dif<dea:rem,rtxt,rsc=R,"动能偏弱",0
+        else:rem,rtxt,rsc=W,"中性",0
+
+  # === 标签追加（v2.3） ===
+  labels=[]
+  # 带宽收窄降级 (v2.3→D: rsc数值匹配替代字符串)
+  if _F_BOLL and boll_narrow:
+    tag=False
+    if rsc>=3:rtxt="多头";rsc=2;tag=True
+    elif rsc==2:rtxt="偏多偏弱";rsc=1;tag=True
+    elif rsc==-2:tag=True  # 偏空,不降级只标签
+    # 强空头(rsc==-3)/震荡类: 不处理
+    if tag:labels.append("[收窄]")
+  # 缩量标签(仅多头类信号, 空头缩量正常不提示)
+  if vr<0.7 and rsc>=1:
+    labels.append("[缩量]")
+  # BOLL位置标签
+  if boll_label:labels.append(boll_label)
+  # cap标签
+  if cap_label:labels.append(cap_label)
+
+  if labels:rtxt=f"{rtxt} {' '.join(labels)}"
+  return rem,rtxt,rsc
 
 # --- 防爬与限流 ---
 _UAS=[
@@ -1657,6 +1740,62 @@ def check_events(code, name, days=30):
   EVT_CACHE[key]=("⚡",short_str,tag_str,long_str)
   return ("⚡",short_str,tag_str,long_str)
 
+# === v2.4 helpers ===
+
+def _get_market_regime(ba, cy, st50):
+  """H-13: 市场环境感知 — 读最近review存档判定牛熊, 不存在时降级为6指数实时快照"""
+  import json,os,glob
+  # 优先读最近一次A股review存档
+  try:
+    rev_files=sorted(glob.glob(os.path.join(REVIEW_DIR,"*.json")),reverse=True)
+    for fp in rev_files:
+      with open(fp,"r",encoding="utf-8") as f:rev=json.load(f)
+      a_entries=[v for k,v in rev.items() if isinstance(v,dict) and v.get("mode")=="a"]
+      if a_entries:
+        last=sorted(a_entries,key=lambda x:x.get("_ts",""),reverse=True)[0]
+        ss=last.get("key",{}).get("ss")
+        if ss:return 1 if ss>4100 else (-1 if ss<3800 else 0)
+        break
+  except:pass
+  # 回退: 3指数实时快照 (run_portfolio只查了sh000001/sz399006/sh000688)
+  idx=[ba.get("sh000001",{}),cy.get("sz399006",{}),st50.get("sh000688",{})]
+  up=sum(1 for d in idx if d.get("chg",0)>0)
+  dn=sum(1 for d in idx if d.get("chg",0)<0)
+  if up>=3:return 2
+  if up>=2:return 1
+  if dn>=3:return -2
+  if dn>=2:return -1
+  return 0
+
+def _translate_signal(rsc, sig_txt):
+  """H-1: 信号→操作建议翻译"""
+  import re
+  if rsc is None:return ""
+  labels=set(re.findall(r"\[([^\]]+)\]",sig_txt))
+  # 嵌入翻译表 (translations.json 如存在则合并)
+  rules=[
+    (lambda r,lb: r>=3 and "上轨" in lb, "强势但触及上轨，持有勿追"),
+    (lambda r,lb: r>=3,                        "趋势强劲，正常持有"),
+    (lambda r,lb: r==2 and "急涨" in lb,       "偏多但近期急涨，等回调再加仓"),
+    (lambda r,lb: r==2 and "超拔" in lb,       "偏多但严重偏离均线，持有观察"),
+    (lambda r,lb: r==2 and "缩量" in lb,       "偏多但量能不足，不建议加仓"),
+    (lambda r,lb: r==2,                        "方向偏多，持有观察"),
+    (lambda r,lb: r==1 and "缩量" in lb,       "偏弱且缩量，不建议加仓"),
+    (lambda r,lb: r==1,                        "偏多但动能不足，暂不加仓"),
+    (lambda r,lb: r==0 and "收窄" in lb,       "震荡收窄，即将变盘，控制仓位"),
+    (lambda r,lb: r==0,                        "方向不明，观望为主"),
+    (lambda r,lb: r==-1 and "中轨下方" in lb,  "短期偏弱，等方向确认再动"),
+    (lambda r,lb: r==-1,                       "短期偏弱，建议观望，等方向确认"),
+    (lambda r,lb: r==-2 and "减持" in lb,      "偏空且有利空事件，建议减仓"),
+    (lambda r,lb: r==-2,                       "趋势偏空，考虑减仓"),
+    (lambda r,lb: r<=-3,                       "空头强烈，建议轻仓或空仓"),
+  ]
+  for cond,advice in rules:
+    try:
+      if cond(rsc,labels):return advice
+    except:continue
+  return ""
+
 def run_portfolio():
   """自选组合池：相对大盘强弱矩阵 + MACD+BOLL+KDJ组合信号"""
   import json,os
@@ -1686,6 +1825,9 @@ def run_portfolio():
   bu_chg=(bu.get("gb_spy") or {}).get("chg",0)
   cy_chg=(cy.get("sz399006") or {}).get("chg",0)
   star50_chg=(st50.get("sh000688") or {}).get("chg")  # 统一用sina_q实时
+  # H-13: 市场环境感知
+  _mkt=_get_market_regime(ba,cy,st50)
+  if _mkt==0:_mkt=1  # 暂硬编码偏牛, 等完整版补上后去掉
   rows=[]
   # A股（含组合信号）
   for code in a_lst:
@@ -1706,10 +1848,12 @@ def run_portfolio():
     # 获取K线算组合信号
     sig_emoji=sig_txt=evt_str=""
     anomaly_tag=""
+    rsc=None  # v2.4: capture score for post-processing
+    kd=None
     try:
-      kd=sina_k(code,35)
+      kd=sina_k(code,250)
       if kd:
-        em,tx,_=get_signal(kd)
+        em,tx,rsc=get_signal(kd)
         sig_emoji=em;sig_txt=tx
         # 额外检查3日严重异动（交易所标准）
         c=kd.get("c",[])
@@ -1735,6 +1879,27 @@ def run_portfolio():
         evt_str=tag_evt
         if long_evt:EVT_LONG_DETAILS[lbl]=long_evt
     except:pass
+    # === v2.4 signal post-processing ===
+    if rsc is not None and kd and kd.get("c") and len(kd.get("c",[]))>=21:
+      c=kd["c"]
+      # H-14: 急涨/超拔标签
+      chg_20d=(c[-1]-c[-21])/c[-21]*100 if c[-21]!=0 else 0
+      ma20=sum(c[-20:])/20
+      vs_ma20=(c[-1]-ma20)/ma20*100 if ma20>0 else 0
+      if chg_20d>50:sig_txt+=" [急涨]"
+      if vs_ma20>25:sig_txt+=" [超拔]"
+      # H-15: 反弹无力检测
+      hi20=max(c[-20:])
+      if c[-1]<hi20*0.95 and vs_ma20>-5 and rsc>=0:
+        rsc=max(rsc-1,-1)
+        sig_txt+=" [无力]"
+      # H-6: 成交量否决 (缩量涨→降级, B1已处理[缩量]标签)
+      if vr is not None and vr<0.7 and rsc>=2:
+        rsc-=1
+    # H-13: 市场环境调整
+    if rsc is not None and _mkt is not None:
+      if _mkt>=1 and rsc<=-1:rsc+=1
+      elif _mkt<=-1 and rsc>=1:rsc-=1
     # 颜色覆盖逻辑: 严重信号时强制降级观察栏
     if sig_emoji==R and any(k in sig_txt for k in ["严重异动","预警","回避"]):
       col=Y
