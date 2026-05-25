@@ -141,6 +141,36 @@ def sina_k(sym,days=35):
     vs=[float(d["volume"]) for d in dt if d.get("volume")] if "volume" in dt[0] else None
     return {"c":cs,"h":hs,"l":ls,"v":vs}
   except:return None
+_BS_SESSION=None
+
+def ak_daily(code, days=250):
+  """Baostock前复权日K — 替代sina_k, 零限流
+  返回 {c:[], h:[], l:[], v:[]} (与sina_k同签)
+  仅失败时回退到sina_k。批量调用共享同一登录会话"""
+  global _BS_SESSION
+  import baostock as bs
+  try:
+    if _BS_SESSION is None:
+      _BS_SESSION=bs.login()
+    raw=code[-6:] if len(code)>6 else code
+    prefix='sz' if raw.startswith(('0','3','2')) else 'sh'
+    symbol=f"{prefix}.{raw}"
+    end_dt=datetime.date.today().strftime('%Y-%m-%d')
+    start_dt=(datetime.date.today()-datetime.timedelta(days=max(days+60,360))).strftime('%Y-%m-%d')
+    rs=bs.query_history_k_data_plus(symbol,
+      "date,open,high,low,close,volume",
+      start_date=start_dt, end_date=end_dt, frequency="d", adjustflag="2")
+    cs,hs,ls,vs=[],[],[],[]
+    while rs.next():
+      r=rs.get_row_data()
+      if r[4]=='' or len(r[1])==0:continue
+      cs.append(float(r[4]));hs.append(float(r[2]))
+      ls.append(float(r[3]));vs.append(float(r[5]))
+    if len(cs)<20:return sina_k(code,days)
+    return {"c":cs[-days:],"h":hs[-days:],"l":ls[-days:],"v":vs[-days:]}
+  except:return sina_k(code,days)
+
+
 
 def is_trading():
   """A股交易时段判断"""
@@ -1780,15 +1810,15 @@ def _translate_signal(rsc, sig_txt):
     (lambda r,lb: r==2 and "超拔" in lb,       "偏多但严重偏离均线，持有观察"),
     (lambda r,lb: r==2 and "缩量" in lb,       "偏多但量能不足，不建议加仓"),
     (lambda r,lb: r==2,                        "方向偏多，持有观察"),
-    (lambda r,lb: r==1 and "缩量" in lb,       "偏弱且缩量，不建议加仓"),
+    (lambda r,lb: r==1 and "缩量" in lb,       "偏多但量能不足，不建议加仓"),
     (lambda r,lb: r==1,                        "偏多但动能不足，暂不加仓"),
     (lambda r,lb: r==0 and "收窄" in lb,       "震荡收窄，即将变盘，控制仓位"),
     (lambda r,lb: r==0,                        "方向不明，观望为主"),
     (lambda r,lb: r==-1 and "中轨下方" in lb,  "短期偏弱，等方向确认再动"),
     (lambda r,lb: r==-1,                       "短期偏弱，建议观望，等方向确认"),
-    (lambda r,lb: r==-2 and "减持" in lb,      "偏空且有利空事件，建议减仓"),
-    (lambda r,lb: r==-2,                       "趋势偏空，考虑减仓"),
-    (lambda r,lb: r<=-3,                       "空头强烈，建议轻仓或空仓"),
+    (lambda r,lb: r==-2 and "减持" in lb,      "偏空且有利空事件，注意风控"),
+    (lambda r,lb: r==-2,                       "趋势偏空，注意风控"),
+    (lambda r,lb: r<=-3,                       "空头信号强烈，严格控制仓位"),
   ]
   for cond,advice in rules:
     try:
@@ -1827,7 +1857,6 @@ def run_portfolio():
   star50_chg=(st50.get("sh000688") or {}).get("chg")  # 统一用sina_q实时
   # H-13: 市场环境感知
   _mkt=_get_market_regime(ba,cy,st50)
-  if _mkt==0:_mkt=1  # 暂硬编码偏牛, 等完整版补上后去掉
   rows=[]
   # A股（含组合信号）
   for code in a_lst:
@@ -1851,7 +1880,7 @@ def run_portfolio():
     rsc=None  # v2.4: capture score for post-processing
     kd=None
     try:
-      kd=sina_k(code,250)
+      kd=ak_daily(code,250)
       if kd:
         em,tx,rsc=get_signal(kd)
         sig_emoji=em;sig_txt=tx
@@ -1890,7 +1919,7 @@ def run_portfolio():
       if vs_ma20>25:sig_txt+=" [超拔]"
       # H-15: 反弹无力检测
       hi20=max(c[-20:])
-      if c[-1]<hi20*0.95 and vs_ma20>-5 and rsc>=0:
+      if c[-1]<hi20*0.95 and vs_ma20>-5 and rsc>=1:
         rsc=max(rsc-1,-1)
         sig_txt+=" [无力]"
       # H-6: 成交量否决 (缩量涨→降级, B1已处理[缩量]标签)
